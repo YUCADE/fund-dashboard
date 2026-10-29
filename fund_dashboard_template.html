@@ -96,6 +96,13 @@
   </div>
 
   <section>
+    <h2><span class="tag">权威</span> 万得Alice 权威附注与配置建议</h2>
+    <p class="desc">由万得金融大模型（Wind Alice）基于<b>基金定期报告、经理任职、指数估值分位</b>等权威数据生成；本地生成后随仓库发布，<b>电脑关机也不影响每日自动推送</b>。附注生成日期见下。</p>
+    <div id="expertOverall" class="note" style="background:#eef6ff;border-color:#bcd4ff;color:#1d3b6b;"></div>
+    <div class="cards" id="expertCards"></div>
+  </section>
+
+  <section>
     <h2><span class="tag">图 1</span> 净值走势（逐日，单位净值 元）</h2>
     <p class="desc">每只基金独立曲线：净值在<b style="color:var(--red)">买入价虚线以上=红（盈利）</b>、<b style="color:var(--green)">以下=绿（亏损）</b>。</p>
     <div class="chart-grid" id="trendGrid"></div>
@@ -119,13 +126,6 @@
     <div class="rec" id="rec"></div>
   </section>
 
-  <section>
-    <h2><span class="tag">权威</span> 万得Alice 权威附注与配置建议</h2>
-    <p class="desc">由万得金融大模型（Wind Alice）基于<b>基金定期报告、经理任职、指数估值分位</b>等权威数据生成；本地生成后随仓库发布，<b>电脑关机也不影响每日自动推送</b>。附注生成日期见下。</p>
-    <div id="expertOverall" class="note" style="background:#eef6ff;border-color:#bcd4ff;color:#1d3b6b;"></div>
-    <div class="cards" id="expertCards"></div>
-  </section>
-
   <footer>数据来源：东方财富基金公开数据（净值/风险指标）＋ 万得Alice（定期报告/估值分位/配置建议）｜ 本看板为基于公开数据的分析可视化，不构成投资建议。</footer>
 </div>
 <script>
@@ -146,6 +146,7 @@ funds.forEach(f => {
   cell.innerHTML = '<h4>' + f.name + '<span class="sub">买入 ' + md(f.buyDate) + ' 价 ' + buyNav.toFixed(4) + '</span></h4><div class="cbox"><canvas></canvas></div>';
   trendGrid.appendChild(cell);
   const cv = cell.querySelector('canvas');
+  try {
   new Chart(cv, {
     type: 'line',
     data: {
@@ -179,6 +180,7 @@ funds.forEach(f => {
       }
     }
   });
+  } catch (e) { try { cv.style.display = 'none'; } catch (_) {} }
 });
 
 /* 图2：每只基金自买入日累计收益 —— 折线图 正红负绿 + 0% 线 */
@@ -200,6 +202,7 @@ funds.forEach(f => {
   cell.innerHTML = '<h4>' + f.name + '<span class="sub">自 ' + md(f.buyDate) + ' 起 ' + (f.holdRet > 0 ? '+' : '') + f.holdRet.toFixed(2) + '%</span></h4><div class="cbox"><canvas></canvas></div>';
   retGrid.appendChild(cell);
   const cv = cell.querySelector('canvas');
+  try {
   new Chart(cv, {
     type: 'line',
     data: {
@@ -244,6 +247,7 @@ funds.forEach(f => {
       }
     }
   });
+  } catch (e) { try { cv.style.display = 'none'; } catch (_) {} }
 });
 
 /* 建议卡片：综合买入日盈亏 + 技术面 */
