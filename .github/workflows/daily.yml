@@ -2,8 +2,14 @@ name: 每日基金看板
 
 on:
   schedule:
-    - cron: '0 12 * * *'          # 北京 20:00 = UTC 12:00
-  workflow_dispatch:              # 允许手动触发验证
+    - cron: '0 12 * * *'          # 北京 20:00 = UTC 12:00（主）
+    - cron: '40 12 * * *'         # 北京 20:40（备用：GitHub 定时器有时会延迟/丢弃主任务，靠这条补上）
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "忽略『今日已推送』检查，强制运行"
+        required: false
+        default: "true"
 
 permissions:
   contents: write
@@ -14,14 +20,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 检查今日是否已推送（防止主/备两条定时重复推微信）
+        id: guard
+        run: |
+          TODAY=$(date -u +%F)
+          MARK=$(cat .last_push_date 2>/dev/null | tr -d '[:space:]')
+          FORCE="${{ github.event.inputs.force }}"
+          if [ "$FORCE" = "true" ]; then
+            echo "手动强制运行"; echo "skip=0" >> "$GITHUB_OUTPUT"
+          elif [ "$MARK" = "$TODAY" ]; then
+            echo "今日($TODAY)已推送过，本次跳过"; echo "skip=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "今日($TODAY)尚未推送，继续"; echo "skip=0" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip != '1'
         with:
           python-version: '3.11'
 
       - name: 生成看板（东方财富免费接口，纯 Python）
+        if: steps.guard.outputs.skip != '1'
         run: python gen_dashboard.py
 
       - name: 提交 index.html（触发 GitHub Pages 重建）
+        if: steps.guard.outputs.skip != '1'
         continue-on-error: true
         run: |
           git config user.email "bot@users.noreply.github.com"
@@ -32,12 +55,25 @@ jobs:
           git push
 
       - name: 推送微信（Server酱）
+        id: push
+        if: steps.guard.outputs.skip != '1'
         env:
           SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
           DASH_URL: https://YUCADE.github.io/fund-dashboard/
         run: |
           TITLE="每日基金看板 $(date +%F)"
           MD="数据已更新，点开查看完整交互图表：${DASH_URL}"
-          curl -sS -X POST "https://sctapi.ftqq.com/${SENDKEY}.send" \
+          RESP=$(curl -sS -X POST "https://sctapi.ftqq.com/${SENDKEY}.send" \
             --data-urlencode "title=${TITLE}" \
-            --data-urlencode "desp=${MD}"
+            --data-urlencode "desp=${MD}")
+          echo "$RESP"
+          echo "$RESP" | grep -q '"errno":0' && echo "ok=1" >> "$GITHUB_OUTPUT" || echo "ok=0" >> "$GITHUB_OUTPUT"
+
+      - name: 记录今日已推送（备用定时据此跳过）
+        if: steps.guard.outputs.skip != '1' && steps.push.outputs.ok == '1'
+        continue-on-error: true
+        run: |
+          date -u +%F > .last_push_date
+          git add .last_push_date
+          git commit -m "mark pushed $(date +%F)" || echo "no change"
+          git push
