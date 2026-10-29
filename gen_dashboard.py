@@ -7,7 +7,8 @@
 
 用法：python3 gen_dashboard.py
 """
-import os, json, re, datetime, subprocess, time
+import os, json, re, datetime, time, threading, urllib.request, urllib.error
+import concurrent.futures
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(HERE, "fund_dashboard_template.html")
@@ -38,6 +39,13 @@ UNI_MIN_SCALE = 5.0     # 规模下限（亿元），过滤迷你/清盘风险
 FINAL_PER_CAT = 6       # 每类进入决赛圈（拉真实净值算风险指标）的数量
 MAX_PER_CAT   = 2       # 最终推荐每类最多几只，保证分散
 
+# 性能相关（云端 GitHub Actions 单次运行时长直接决定微信推送延迟）
+NAV_LOOKBACK_DAYS = 420  # 净值回溯天数（≈285 个交易日，足够算 252 日风险指标）
+NAV_MAX_WORKERS   = 6    # 净值并发数（对东方财富保持温和，避免被限流）
+HTTP_TIMEOUT      = 15
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
 # 数据驱动筛选权重（用于综合打分）
 W_SHARPE = 0.40
 W_MDD = 0.35
@@ -49,30 +57,97 @@ def load_config():
         return json.load(f)
 
 
-def fetch_nav(code, start_date=None):
-    """东方财富历史净值（分页拉取，单页上限约20条）。返回升序 (dates, dwjz, ljjz)。"""
-    if start_date is None:
-        start_date = (datetime.date.today() - datetime.timedelta(days=400)).isoformat()
+def _http_get(url, referer, timeout=HTTP_TIMEOUT):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA,
+        "Referer": referer,
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "ignore")
+
+
+def _http_get_retry(url, referer, tries=2, timeout=HTTP_TIMEOUT):
+    """轻量重试：进程内复用连接，避免为每次请求 fork 一个 curl 进程（Actions 上开销明显）。"""
+    for i in range(tries):
+        try:
+            t = _http_get(url, referer, timeout)
+            if t and t.strip():
+                return t
+        except Exception:
+            pass
+        if i + 1 < tries:
+            time.sleep(0.6 * (i + 1))
+    return None
+
+
+def _ts_to_date(ms):
+    """东方财富时间戳为北京时间当日 0 点，按 UTC+8 还原成 YYYY-MM-DD。"""
+    return datetime.datetime.fromtimestamp(
+        ms / 1000.0, datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d")
+
+
+def fetch_nav_pz(code, start_date):
+    """pingzhongdata 单请求返回该基金全历史净值（单位净值 + 累计净值），比 lsjz 分页快约 10 倍。"""
+    url = "https://fund.eastmoney.com/pingzhongdata/%s.js?v=%d" % (code, int(time.time() * 1000))
+    text = _http_get_retry(url, "https://fund.eastmoney.com/")
+    if not text or "Data_netWorthTrend" not in text:
+        return [], [], []
+    try:
+        m1 = re.search(r"Data_netWorthTrend\s*=\s*(\[.*?\])\s*;", text, re.S)
+        if not m1:
+            return [], [], []
+        trend = json.loads(m1.group(1))
+        ac_map = {}
+        m2 = re.search(r"Data_ACWorthTrend\s*=\s*(\[.*?\])\s*;", text, re.S)
+        if m2:
+            try:
+                for it in json.loads(m2.group(1)):
+                    try:
+                        ac_map[int(it[0])] = float(it[1])
+                    except Exception:
+                        continue
+            except Exception:
+                ac_map = {}
+        rows = []
+        for it in trend:
+            try:
+                x = int(it["x"])
+                y = float(it["y"])
+            except Exception:
+                continue
+            if y <= 0:
+                continue
+            rows.append((_ts_to_date(x), y, ac_map.get(x) or y))
+        if not rows:
+            return [], [], []
+        rows.sort(key=lambda r: r[0])
+        kept = [r for r in rows if r[0] >= start_date]
+        if len(kept) < len(rows):          # 多留 1 条窗口前值，保证首日收益可算
+            i = len(rows) - len(kept) - 1
+            if i >= 0:
+                kept = [rows[i]] + kept
+        rows = kept or rows[-300:]
+    except Exception:
+        return [], [], []
+    return [r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows]
+
+
+def fetch_nav_lsjz(code, start_date):
+    """备用通道：f10/lsjz 历史净值分页（单页上限 20 条）。"""
     rows = []
     page = 1
-    while page <= 80:
+    while page <= 60:
         ts = int(time.time() * 1000)
         url = ("https://api.fund.eastmoney.com/f10/lsjz?fundCode=%s&pageIndex=%d&pageSize=20&_=%d"
                % (code, page, ts))
-        cmd = ["curl", "-sS", "-L", url,
-               "-H", "Referer: http://fundf10.eastmoney.com/",
-               "-H", "User-Agent: Mozilla/5.0"]
-        data = None
-        for _ in range(3):
-            try:
-                p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=30)
-                if p.returncode == 0 and p.stdout.strip():
-                    data = json.loads(p.stdout)
-                    break
-            except Exception:
-                pass
-            time.sleep(2)
-        if data is None:
+        text = _http_get_retry(url, "http://fundf10.eastmoney.com/")
+        if not text:
+            break
+        try:
+            data = json.loads(text)
+        except Exception:
             break
         lst = (data.get("Data") or {}).get("LSJZList") or []
         if not lst:
@@ -95,6 +170,46 @@ def fetch_nav(code, start_date=None):
         page += 1
     rows.sort(key=lambda x: x[0])
     return [r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows]
+
+
+_NAV_CACHE = {}
+_NAV_LOCK = threading.Lock()
+
+
+def fetch_nav(code, start_date=None):
+    """净值序列（升序 dates / dwjz / ljjz）。结果进程内缓存，持仓与决赛圈共用同一份数据。"""
+    with _NAV_LOCK:
+        if code in _NAV_CACHE:
+            return _NAV_CACHE[code]
+    if start_date is None:
+        start_date = (datetime.date.today() - datetime.timedelta(days=NAV_LOOKBACK_DAYS)).isoformat()
+    res = fetch_nav_pz(code, start_date)
+    if not res[0]:
+        res = fetch_nav_lsjz(code, start_date)
+    with _NAV_LOCK:
+        _NAV_CACHE[code] = res
+    return res
+
+
+def _safe_fetch(args):
+    code, start_date = args
+    try:
+        return code, fetch_nav(code, start_date)
+    except Exception:
+        return code, ([], [], [])
+
+
+def prefetch_navs(codes, start_map=None):
+    """并发预热净值缓存。start_map: code -> 起始日（可选）。返回耗时秒数。"""
+    start_map = start_map or {}
+    todo = [(c, start_map.get(c)) for c in dict.fromkeys(codes)
+            if c and c not in _NAV_CACHE]
+    if not todo:
+        return 0.0
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=NAV_MAX_WORKERS) as ex:
+        list(ex.map(_safe_fetch, todo))
+    return round(time.time() - t0, 1)
 
 
 def pct(a, b):
@@ -309,18 +424,8 @@ def fetch_ranking(ft, pn=200, pi=1):
     url = ("https://fund.eastmoney.com/data/rankhandler.aspx?op=ph&dt=kf&ft=%s&rs=&gs=0"
            "&sc=1nzf&st=desc&sd=%s&ed=%s&qdii=&tabSubtype=,,,,,"
            "&pi=%d&pn=%d&dx=1&_=%d" % (ft, sd, ed, pi, pn, ts))
-    cmd = ["curl", "-sS", "-L", url,
-           "-H", "Referer: https://fund.eastmoney.com/",
-           "-H", "User-Agent: Mozilla/5.0"]
-    for _ in range(3):
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=30)
-            if p.returncode == 0 and p.stdout.strip():
-                return parse_ranking(p.stdout)
-        except Exception:
-            pass
-        time.sleep(2)
-    return []
+    text = _http_get_retry(url, "https://fund.eastmoney.com/", tries=3)
+    return parse_ranking(text) if text else []
 
 
 def parse_ranking(text):
@@ -350,14 +455,20 @@ def parse_ranking(text):
 
 
 def build_universe():
-    """东方财富实时榜单扩池：按类别取规模 Top，加质量门槛；附海外/黄金卫星。返回候选列表。"""
+    """东方财富实时榜单扩池：按类别取规模 Top，加质量门槛；附海外/黄金卫星。返回候选列表。
+    4 个类别榜单并发拉取，顺序保持稳定以便结果可复现。"""
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(CATEGORIES)) as ex:
+        futs = {ex.submit(fetch_ranking, ft, UNI_PER_CAT, 1): ft for ft, _, _ in CATEGORIES}
+        for f in concurrent.futures.as_completed(futs):
+            ft = futs[f]
+            try:
+                results[ft] = f.result()
+            except Exception:
+                results[ft] = []
     uni = []
     for ft, cat_label, cat_key in CATEGORIES:
-        try:
-            rows = fetch_ranking(ft, pn=UNI_PER_CAT, pi=1)
-        except Exception:
-            rows = []
-        for r in rows:
+        for r in results.get(ft, []):
             r["cat"] = cat_key
             uni.append(r)
     for code, name, cat, fee in SATELLITES:
@@ -396,7 +507,8 @@ def screen_universe(held_codes, dump_path=None):
     for cat, lst in by_cat.items():
         lst.sort(key=lambda x: (x.get("scale") or 0), reverse=True)
         finalists += lst[:FINAL_PER_CAT]
-    # 计算真实风险指标
+    # 计算真实风险指标（决赛圈净值并发预热后再逐只计算）
+    t_pre = prefetch_navs([r["code"] for r in finalists])
     scored = []
     for r in finalists:
         try:
@@ -408,6 +520,7 @@ def screen_universe(held_codes, dump_path=None):
             scored.append(r)
         except Exception:
             continue
+    print("[info] 决赛圈 %d 只，净值并发拉取 %.1fs" % (len(finalists), t_pre))
     if dump_path:
         try:
             with open(dump_path, "w", encoding="utf-8") as f:
@@ -507,10 +620,25 @@ def load_expert():
 
 
 def main():
+    T0 = time.time()
     cfg_list = load_config()
     start_map = {c["code"]: c.get("buyDate", "") for c in cfg_list}
     with open(TEMPLATE, encoding="utf-8") as f:
         template = f.read()
+    # 持仓净值并发预热：起始日取「回溯窗口」与「买入日前 30 天」中更早者，保证买入点一定落在序列内
+    pre_start = {}
+    for c in cfg_list:
+        sd = (datetime.date.today() - datetime.timedelta(days=NAV_LOOKBACK_DAYS)).isoformat()
+        b = c.get("buyDate") or ""
+        if b:
+            try:
+                bd = (datetime.date.fromisoformat(b) - datetime.timedelta(days=30)).isoformat()
+                if bd < sd:
+                    sd = bd
+            except Exception:
+                pass
+        pre_start[c["code"]] = sd
+    t_nav = prefetch_navs(list(pre_start), pre_start)
     funds = []
     for i, c in enumerate(cfg_list):
         try:
@@ -522,6 +650,7 @@ def main():
             print("[!] 基金 %s 取数失败: %s" % (c.get("code"), e))
     if not funds:
         raise SystemExit("无基金数据，生成中止")
+    print("[info] 持仓 %d 只，净值并发拉取 %.1fs" % (len(funds), t_nav))
     asof = max(f["navSeries"]["dates"][-1] for f in funds)
     recs, candidates = screen_universe({f["code"] for f in funds},
                                       os.path.join(HERE, "screen_candidates.json"))
@@ -553,6 +682,7 @@ def main():
     src = "万得Alice精选" if reco.get("picks") else "数据驱动筛选"
     print("[done] asOf=%s 推荐%d只(%s) 专家附注=%s 万得推荐=%s" % (
         asof, len(recs), src, expert.get("generatedAt") or "无", reco.get("generatedAt") or "无"))
+    print("[time] 总耗时 %.1fs" % (time.time() - T0))
 
 
 if __name__ == "__main__":
