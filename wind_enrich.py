@@ -106,6 +106,25 @@ def extract_json(text):
     return None
 
 
+def extract_from_session_log(stdout):
+    """兜底：CLI 有时只在 session 日志里落 agentResult.value 原文。
+    从 stdout 中的 ALICE_SESSION_LOG= 路径读取日志，定位 agentResult.value: 行解析。"""
+    m = re.search(r'ALICE_SESSION_LOG=(\S+)', stdout or "")
+    if not m:
+        return None
+    log = m.group(1)
+    if not os.path.isfile(log):
+        return None
+    for line in open(log, encoding="utf-8", errors="ignore"):
+        if "agentResult.value:" in line:
+            seg = line.split("agentResult.value:", 1)[1].strip()
+            try:
+                return json.loads(seg)
+            except Exception:
+                return None
+    return None
+
+
 def run():
     cli = find_cli()
     if not cli:
@@ -120,14 +139,14 @@ def run():
     with open(PROMPT_FILE, "w", encoding="utf-8") as f:
         f.write(prompt)
     print("[*] 调用万得Alice（合并：权威附注 + 精选推荐），约需数分钟…")
-    cmd = cli + ["--prompt", prompt, "--no-wait", "-d", HERE]
+    cmd = cli + ["--prompt", prompt, "--no-wait", "--new-session", "-d", HERE]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=2400)
     except Exception as e:
         print("[!] 调用失败:", e)
         sys.exit(4)
     stdout = p.stdout or ""
-    data = extract_json(stdout)
+    data = extract_json(stdout) or extract_from_session_log(stdout)
     if not data:
         with open(RAW_OUT, "w", encoding="utf-8") as f:
             f.write(stdout)
