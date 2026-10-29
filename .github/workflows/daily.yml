@@ -26,18 +26,18 @@ jobs:
         run: |
           git config user.email "bot@users.noreply.github.com"
           git config user.name "fund-bot"
-          git add index.html
+          git add index.html fund_meta_cache.json
+          [ -f screen_candidates.json ] && git add screen_candidates.json || true
           git commit -m "update dashboard $(date +%F)" || echo "no change"
           git push
 
       - name: 推送微信（Server酱）
         env:
           SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          DASH_URL: https://YUCADE.github.io/fund-dashboard/
         run: |
-          # 缓存戳：每次推送链接带唯一时间戳，避免浏览器/微信内置浏览器缓存旧版看板
-          DASH_URL="https://YUCADE.github.io/fund-dashboard/?v=$(date +%Y%m%d%H%M%S)"
           TITLE="每日基金看板 $(date +%F)"
-          MD="数据已更新，点开查看完整交互图表（含万得Alice权威附注）：${DASH_URL}"
+          MD="数据已更新，点开查看完整交互图表：${DASH_URL}"
           curl -sS -X POST "https://sctapi.ftqq.com/${SENDKEY}.send" \
             --data-urlencode "title=${TITLE}" \
             --data-urlencode "desp=${MD}"

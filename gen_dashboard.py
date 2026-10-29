@@ -7,7 +7,7 @@
 
 用法：python3 gen_dashboard.py
 """
-import os, json, re, datetime, time, threading, urllib.request, urllib.error
+import os, json, re, sys, datetime, time, threading, urllib.request, urllib.error
 import concurrent.futures
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -632,10 +632,10 @@ def map_cat(cat_raw):
         return "货币·现金"
     if "债券" in c:
         return "债券·稳健"
-    if "QDII" in c or "海外" in c:
-        return "海外·QDII"
     if "指数" in c or "联接" in c or "ETF" in c:
         return "指数·宽基/行业"
+    if "QDII" in c or "海外" in c:
+        return "海外·QDII"
     if "股票" in c:
         return "股票型·主动"
     if "黄金" in c or "商品" in c:
@@ -646,16 +646,46 @@ def map_cat(cat_raw):
 
 
 _PROFILE_CACHE = {}
+META_CACHE_PATH = os.path.join(HERE, "fund_meta_cache.json")
+_META_DISK = None
+
+
+def _meta_disk():
+    """基金概况持久缓存（code -> {cat_raw,scale,fee,name}）。落盘是为了网络抖动时仍能完整展示。"""
+    global _META_DISK
+    if _META_DISK is None:
+        try:
+            with open(META_CACHE_PATH, encoding="utf-8") as f:
+                _META_DISK = json.load(f)
+        except Exception:
+            _META_DISK = {}
+    return _META_DISK
+
+
+def _meta_disk_put(code, prof):
+    d = _meta_disk()
+    if d.get(code) == prof:
+        return
+    d[code] = prof
+    try:
+        with open(META_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=1, sort_keys=True)
+    except Exception:
+        pass
 
 
 def fetch_fund_profile(code):
-    """基金基本概况（类型/净资产规模/费率）。用于补齐榜单里为空的规模/费率字段。结果进程内缓存。"""
+    """基金基本概况（类型/净资产规模/费率）。优先网络，失败退回持久缓存（只缓存成功结果）。"""
     with _NAV_LOCK:
         if code in _PROFILE_CACHE:
             return _PROFILE_CACHE[code]
     prof = _fetch_profile_uncached(code)
-    with _NAV_LOCK:
-        _PROFILE_CACHE[code] = prof
+    if prof:
+        with _NAV_LOCK:
+            _PROFILE_CACHE[code] = prof
+        _meta_disk_put(code, prof)
+    else:
+        prof = _meta_disk().get(code)     # 网络不可用时用上次成功值兜底
     return prof
 
 
@@ -741,6 +771,54 @@ def load_expert():
     return {"funds": {}, "overall": "", "generatedAt": ""}
 
 
+def load_screen_cache():
+    """上一次「全量」跑出的候选池快照（含类别/规模/费率/指标），作为快速模式的元数据兜底。"""
+    p = os.path.join(HERE, "screen_candidates.json")
+    if os.path.exists(p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                return {x.get("code"): x for x in json.load(f) if isinstance(x, dict)}
+        except Exception:
+            pass
+    return {}
+
+
+def build_quick_candidates(codes):
+    """日常快速模式用的最小候选集：只给万得精选这几只补「元数据 + 风险指标」。
+    跳过榜单扩池与 28 只决赛圈取数（每日推送其实只用到这 6 只，扩池数据是月度才需要的）。"""
+    codes = [c for c in dict.fromkeys(codes) if c]
+    if not codes:
+        return []
+    prefetch_navs(codes)
+    prefetch_profiles(codes)
+    snap = load_screen_cache()
+    out = []
+    for c in codes:
+        prof = fetch_fund_profile(c) or {}
+        old = snap.get(c) or {}
+        dates, dwjz, ljjz = fetch_nav(c)
+        fee = prof.get("fee") or old.get("fee")
+        m = screen_metrics(ljjz, fee or 0.0) if len(ljjz) >= 180 else (old.get("m") or {})
+        cat = old.get("cat") or (map_cat(prof.get("cat_raw")) if prof.get("cat_raw") else "")
+        out.append({"code": c, "name": prof.get("name") or old.get("name") or c,
+                    "cat": cat, "scale": prof.get("scale") or old.get("scale"),
+                    "fee": fee, "m": m})
+    return out
+
+
+def reco_age_days(reco):
+    """万得精选距今多少天（无法解析时返回 999，触发全量模式兜底）。"""
+    g = (reco or {}).get("generatedAt") or ""
+    m = re.search(r"(\d{4})\D(\d{1,2})\D(\d{1,2})", g)
+    if not m:
+        return 999
+    try:
+        d = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        return (datetime.date.today() - d).days
+    except Exception:
+        return 999
+
+
 def main():
     T0 = time.time()
     cfg_list = load_config()
@@ -760,7 +838,15 @@ def main():
             except Exception:
                 pass
         pre_start[c["code"]] = sd
-    t_nav = prefetch_navs(list(pre_start), pre_start)
+    expert = load_expert()
+    reco = load_recommendations()
+    force_codes = [p.get("code") for p in (reco.get("picks") or []) if isinstance(p, dict)]
+    # 运行模式：日常「快速」只取 7 只持仓 + 6 只万得精选的净值/概况（约 13 个请求）；
+    # 「全量」（--full，或在没有精选/精选超过 45 天时自动触发）才做榜单扩池 + 28 只决赛圈，
+    # 产物 screen_candidates.json 供本地万得Alice每月精选使用。
+    need_full = ("--full" in sys.argv) or (not force_codes) or reco_age_days(reco) > 45
+    # 净值一次性并发预热：持仓与精选进同一个池，少一轮往返
+    t_nav = prefetch_navs(list(pre_start) + [c for c in force_codes if c not in pre_start], pre_start)
     funds = []
     for i, c in enumerate(cfg_list):
         try:
@@ -774,12 +860,17 @@ def main():
         raise SystemExit("无基金数据，生成中止")
     print("[info] 持仓 %d 只，净值并发拉取 %.1fs" % (len(funds), t_nav))
     asof = max(f["navSeries"]["dates"][-1] for f in funds)
-    expert = load_expert()
-    reco = load_recommendations()
-    force_codes = [p.get("code") for p in (reco.get("picks") or []) if isinstance(p, dict)]
-    recs, candidates = screen_universe({f["code"] for f in funds},
-                                      os.path.join(HERE, "screen_candidates.json"),
-                                      force_codes=force_codes)
+    if need_full:
+        recs, candidates = screen_universe({f["code"] for f in funds},
+                                          os.path.join(HERE, "screen_candidates.json"),
+                                          force_codes=force_codes)
+        print("[info] 模式=全量（榜单扩池+决赛圈筛选，供月度万得精选）")
+    else:
+        t_q = time.time()
+        candidates = build_quick_candidates(force_codes)
+        recs = []
+        print("[info] 模式=快速（只取精选 %d 只，跳过扩池），耗时 %.1fs"
+              % (len(candidates), time.time() - t_q))
     # 万得Alice推荐存在时，以其精选列表作为主推荐（候选池仍由榜单扩池+风险筛选产生）；
     # 缺失时退回数据驱动筛选结果，保证关机也能正常推送。
     if reco.get("picks"):
