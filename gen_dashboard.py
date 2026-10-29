@@ -41,7 +41,7 @@ MAX_PER_CAT   = 2       # 最终推荐每类最多几只，保证分散
 
 # 性能相关（云端 GitHub Actions 单次运行时长直接决定微信推送延迟）
 NAV_LOOKBACK_DAYS = 420  # 净值回溯天数（≈285 个交易日，足够算 252 日风险指标）
-NAV_MAX_WORKERS   = 6    # 净值并发数（对东方财富保持温和，避免被限流）
+NAV_MAX_WORKERS   = 12   # 净值并发数（pingzhongdata 为 CDN 静态文件，可承受较高并发）
 HTTP_TIMEOUT      = 15
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -184,6 +184,9 @@ def fetch_nav(code, start_date=None):
     if start_date is None:
         start_date = (datetime.date.today() - datetime.timedelta(days=NAV_LOOKBACK_DAYS)).isoformat()
     res = fetch_nav_pz(code, start_date)
+    if not res[0]:                       # CDN 偶发抖动时先重试一次，避免退回慢速分页通道
+        time.sleep(0.5)
+        res = fetch_nav_pz(code, start_date)
     if not res[0]:
         res = fetch_nav_lsjz(code, start_date)
     with _NAV_LOCK:
@@ -197,6 +200,13 @@ def _safe_fetch(args):
         return code, fetch_nav(code, start_date)
     except Exception:
         return code, ([], [], [])
+
+
+def _safe_profile(code):
+    try:
+        return fetch_fund_profile(code)
+    except Exception:
+        return None
 
 
 def prefetch_navs(codes, start_map=None):
@@ -477,8 +487,9 @@ def build_universe():
     return uni
 
 
-def screen_universe(held_codes, dump_path=None):
+def screen_universe(held_codes, dump_path=None, force_codes=None):
     """数据驱动筛选（B）：榜单扩池 → 质量门槛 → 决赛圈拉真实净值算风险指标 → 综合打分 → 每类≤2只。
+    force_codes: 万得精选代码，即使当日未进榜单也强制纳入（否则卡片会缺类别/规模/费率）。
     返回 (recs, candidates)；candidates 写入 dump_path 供本地万得Alice生成推荐（云端不调用万得）。"""
     uni = build_universe()
     cands = []
@@ -507,6 +518,37 @@ def screen_universe(held_codes, dump_path=None):
     for cat, lst in by_cat.items():
         lst.sort(key=lambda x: (x.get("scale") or 0), reverse=True)
         finalists += lst[:FINAL_PER_CAT]
+    forced = [c for c in (force_codes or []) if c and c not in held_codes]
+    in_final = {r["code"] for r in finalists}
+    miss = [c for c in forced if c not in in_final]
+    if miss:
+        # 万得精选可能落在当日榜单之外（榜单按近1年涨幅取前N，会自然轮动），
+        # 用概况接口补齐类别/规模/费率后强制纳入，保证推荐卡片信息完整。
+        by_code = {r["code"]: r for r in uni}
+        need_prof = [c for c in miss
+                     if c not in by_code or by_code[c].get("scale") is None or not by_code[c].get("fee")]
+        profs = {}
+        if need_prof:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=NAV_MAX_WORKERS) as ex:
+                for c, prof in zip(need_prof, ex.map(_safe_profile, need_prof)):
+                    profs[c] = prof
+        for c in miss:
+            row = by_code.get(c)
+            prof = profs.get(c) or {}
+            if row is None:
+                row = {"code": c, "name": prof.get("name") or c,
+                       "cat": map_cat(prof.get("cat_raw")), "scale": prof.get("scale"),
+                       "y1": None, "y2": None, "y3": None,
+                       "fee": prof.get("fee") or 0.0, "curated": True}
+                uni.append(row)
+            else:                          # 榜单里规模/费率为空时用概况页补齐
+                if row.get("scale") is None and prof.get("scale"):
+                    row["scale"] = prof["scale"]
+                if not row.get("fee") and prof.get("fee"):
+                    row["fee"] = prof["fee"]
+            row["forced"] = True          # 仅用于展示补齐，不参与数据驱动选基
+            finalists.append(row)
+        print("[info] 万得精选补位 %d 只：%s" % (len(miss), ",".join(miss)))
     # 计算真实风险指标（决赛圈净值并发预热后再逐只计算）
     t_pre = prefetch_navs([r["code"] for r in finalists])
     scored = []
@@ -520,7 +562,8 @@ def screen_universe(held_codes, dump_path=None):
             scored.append(r)
         except Exception:
             continue
-    print("[info] 决赛圈 %d 只，净值并发拉取 %.1fs" % (len(finalists), t_pre))
+    print("[info] 决赛圈 %d 只，净值并发拉取 %.1fs，成功计分 %d 只" % (
+        len(finalists), t_pre, len(scored)))
     if dump_path:
         try:
             with open(dump_path, "w", encoding="utf-8") as f:
@@ -542,6 +585,8 @@ def screen_universe(held_codes, dump_path=None):
     def take(qualified_only):
         pick, per = [], {}
         for x in scored:
+            if x.get("forced"):           # 万得精选补位项不参与数据驱动选基
+                continue
             if qualified_only and not (x["m"]["sharpe"] >= 0 and x["m"]["mdd"] >= -20):
                 continue
             if len(pick) >= 6:
@@ -558,6 +603,8 @@ def screen_universe(held_codes, dump_path=None):
         for x in scored:
             if len(pick) >= 6:
                 break
+            if x.get("forced"):
+                continue
             if x not in pick:
                 pick.append(x)
     res = []
@@ -574,6 +621,81 @@ def screen_universe(held_codes, dump_path=None):
             "score": x["score"], "alice": None,
         })
     return res, scored
+
+
+FEE_FIELDS = ("管理费率", "托管费率", "销售服务费率")
+
+
+def map_cat(cat_raw):
+    c = cat_raw or ""
+    if "货币" in c:
+        return "货币·现金"
+    if "债券" in c:
+        return "债券·稳健"
+    if "QDII" in c or "海外" in c:
+        return "海外·QDII"
+    if "指数" in c or "联接" in c or "ETF" in c:
+        return "指数·宽基/行业"
+    if "股票" in c:
+        return "股票型·主动"
+    if "黄金" in c or "商品" in c:
+        return "商品·黄金"
+    if "混合" in c:
+        return "混合·均衡"
+    return "其他"
+
+
+_PROFILE_CACHE = {}
+
+
+def fetch_fund_profile(code):
+    """基金基本概况（类型/净资产规模/费率）。用于补齐榜单里为空的规模/费率字段。结果进程内缓存。"""
+    with _NAV_LOCK:
+        if code in _PROFILE_CACHE:
+            return _PROFILE_CACHE[code]
+    prof = _fetch_profile_uncached(code)
+    with _NAV_LOCK:
+        _PROFILE_CACHE[code] = prof
+    return prof
+
+
+def _fetch_profile_uncached(code):
+    text = _http_get_retry("https://fundf10.eastmoney.com/jbgk_%s.html" % code,
+                           "https://fundf10.eastmoney.com/")
+    if not text:
+        return None
+    seg = [re.sub(r"\s+", "", x) for x in re.split(r"\|", re.sub(r"<[^>]+>", "|", text))]
+    seg = [x for x in seg if x]
+
+    def pick(label):
+        for i, x in enumerate(seg):
+            if x == label:
+                return seg[i + 1] if i + 1 < len(seg) else ""
+        return ""
+
+    fee = 0.0
+    for k in FEE_FIELDS:
+        m = re.search(r"([\d.]+)%", pick(k))
+        if m:
+            fee += float(m.group(1))
+    scale = None
+    m = re.search(r"([\d.]+)亿元", pick("净资产规模"))
+    if m:
+        scale = float(m.group(1))
+    return {"cat_raw": pick("基金类型"), "scale": scale,
+            "fee": round(fee, 2), "name": pick("基金简称")}
+
+
+def prefetch_profiles(codes):
+    """并发预热概况缓存（只取缺失项），返回 code -> profile。"""
+    todo = [c for c in dict.fromkeys(codes) if c]
+    with _NAV_LOCK:
+        todo = [c for c in todo if c not in _PROFILE_CACHE]
+    if not todo:
+        return {}
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(todo), NAV_MAX_WORKERS)) as ex:
+        return {c: p for c, p in zip(todo, ex.map(_safe_profile, todo)) if p}
 
 
 def load_recommendations():
@@ -652,29 +774,36 @@ def main():
         raise SystemExit("无基金数据，生成中止")
     print("[info] 持仓 %d 只，净值并发拉取 %.1fs" % (len(funds), t_nav))
     asof = max(f["navSeries"]["dates"][-1] for f in funds)
-    recs, candidates = screen_universe({f["code"] for f in funds},
-                                      os.path.join(HERE, "screen_candidates.json"))
     expert = load_expert()
     reco = load_recommendations()
+    force_codes = [p.get("code") for p in (reco.get("picks") or []) if isinstance(p, dict)]
+    recs, candidates = screen_universe({f["code"] for f in funds},
+                                      os.path.join(HERE, "screen_candidates.json"),
+                                      force_codes=force_codes)
     # 万得Alice推荐存在时，以其精选列表作为主推荐（候选池仍由榜单扩池+风险筛选产生）；
     # 缺失时退回数据驱动筛选结果，保证关机也能正常推送。
     if reco.get("picks"):
+        # 精选卡片统一用「实时数据 + 概况补齐」渲染：榜单里规模/费率为空时用基金概况页补上，
+        # 避免出现「规模?亿 / 综合费率 0.00%」这类误导性展示。
+        prefetch_profiles([p.get("code") for p in reco["picks"] if isinstance(p, dict)])
         cmap = {c["code"]: c for c in candidates}
         disp = []
         for p in reco["picks"]:
-            c = cmap.get(p.get("code"))
-            if c:
-                m = c["m"]
-                meta = p.get("meta") or ("%s ｜ 规模%s亿 ｜ 年化收益 %+.1f%% / 近1年回撤 %+.1f%% / 夏普 %.2f / 索提诺 %.2f / 综合费率 %.2f%%"
-                       % (c["cat"], ("%.1f" % c["scale"]) if c.get("scale") else "?",
-                          m["annRet"], m["mdd"], m["sharpe"], m["sortino"], c.get("fee") or 0))
-                name = p.get("name") or c["name"]
-                cat = c["cat"]
+            code = p.get("code")
+            c = cmap.get(code) or {}
+            prof = fetch_fund_profile(code) or {}
+            m = c.get("m") or {}
+            name = p.get("name") or c.get("name") or prof.get("name") or code
+            cat = c.get("cat") or map_cat(prof.get("cat_raw")) or p.get("cat") or "万得精选"
+            scale = c.get("scale") or prof.get("scale")
+            fee = c.get("fee") or prof.get("fee")
+            if m:
+                meta = ("%s ｜ 规模%s亿 ｜ 年化收益 %+.1f%% / 近1年回撤 %+.1f%% / 夏普 %.2f / 索提诺 %.2f / 综合费率 %.2f%%"
+                        % (cat, ("%.1f" % scale) if scale else "?",
+                           m["annRet"], m["mdd"], m["sharpe"], m["sortino"], fee or 0))
             else:
                 meta = p.get("meta") or ""
-                name = p.get("name", "")
-                cat = p.get("cat", "")
-            disp.append({"code": p.get("code"), "name": name, "cat": cat, "meta": meta,
+            disp.append({"code": code, "name": name, "cat": cat, "meta": meta,
                          "p": p.get("reason", "") or "万得Alice 精选推荐。", "score": None, "alice": True})
         if disp:
             recs = disp
