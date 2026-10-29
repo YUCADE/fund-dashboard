@@ -1,0 +1,42 @@
+name: 每日基金看板
+
+on:
+  schedule:
+    - cron: '0 12 * * *'          # 北京 20:00 = UTC 12:00
+  workflow_dispatch:              # 允许手动触发验证
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 生成看板（东方财富免费接口，纯 Python）
+        run: python gen_dashboard.py
+
+      - name: 提交 index.html（触发 GitHub Pages 重建）
+        continue-on-error: true
+        run: |
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name "fund-bot"
+          git add index.html
+          git commit -m "update dashboard $(date +%F)" || echo "no change"
+          git push
+
+      - name: 推送微信（Server酱）
+        env:
+          SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          DASH_URL: https://YUCADE.github.io/fund-dashboard/
+        run: |
+          TITLE="每日基金看板 $(date +%F)"
+          MD="数据已更新，点开查看完整交互图表：${DASH_URL}"
+          curl -sS -X POST "https://sctapi.ftqq.com/${SENDKEY}.send" \
+            --data-urlencode "title=${TITLE}" \
+            --data-urlencode "desp=${MD}"
