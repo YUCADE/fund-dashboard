@@ -41,7 +41,8 @@ MAX_PER_CAT   = 2       # 最终推荐每类最多几只，保证分散
 
 # 性能相关（云端 GitHub Actions 单次运行时长直接决定微信推送延迟）
 NAV_LOOKBACK_DAYS = 420  # 净值回溯天数（≈285 个交易日，足够算 252 日风险指标）
-NAV_MAX_WORKERS   = 6    # 净值并发数：实测 6 并发最稳，更高并发会被服务端节流（单请求耗时反而翻倍）
+NAV_MAX_WORKERS   = 8    # 并发上限：实测并发过高会被服务端节流；实际并发取 min(待取数量, 该值)，尽量一轮取完
+PROFILE_TTL_DAYS  = 30   # 基金概况（规模/费率）持久缓存有效期；万得精选每月全量跑时会强制刷新
 HTTP_TIMEOUT      = 15
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -221,7 +222,9 @@ def prefetch_navs(codes, start_map=None):
     if not todo:
         return 0.0
     t0 = time.time()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=NAV_MAX_WORKERS) as ex:
+    # 并发 = min(待取数量, 上限)：日常只有 7-13 个请求，一次发完只付一轮网络延迟
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(todo), NAV_MAX_WORKERS)) as ex:
         list(ex.map(_safe_fetch, todo))
     return round(time.time() - t0, 1)
 
@@ -668,9 +671,11 @@ def _meta_disk():
 
 def _meta_disk_put(code, prof):
     d = _meta_disk()
-    if d.get(code) == prof:
+    ent = dict(prof)
+    ent["_ts"] = datetime.date.today().isoformat()
+    if d.get(code) == ent:
         return
-    d[code] = prof
+    d[code] = ent
     try:
         with open(META_CACHE_PATH, "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=1, sort_keys=True)
@@ -678,11 +683,30 @@ def _meta_disk_put(code, prof):
         pass
 
 
-def fetch_fund_profile(code):
-    """基金基本概况（类型/净资产规模/费率）。优先网络，失败退回持久缓存（只缓存成功结果）。"""
+def _meta_fresh(code, max_age_days):
+    """持久缓存是否仍在有效期（规模/费率按季度披露，30 天内不必再请求）。"""
+    ent = _meta_disk().get(code)
+    if not isinstance(ent, dict) or not ent.get("fee"):
+        return False
+    ts = ent.get("_ts") or ""
+    try:
+        d = datetime.date.fromisoformat(ts)
+    except Exception:
+        return False
+    return (datetime.date.today() - d).days <= max_age_days
+
+
+def fetch_fund_profile(code, max_age_days=PROFILE_TTL_DAYS, force=False):
+    """基金基本概况（类型/净资产规模/费率）。
+    持久缓存 30 天内直接复用（规模/费率按季度披露，每日重取纯属浪费请求）；网络失败时也退回缓存。"""
     with _NAV_LOCK:
         if code in _PROFILE_CACHE:
             return _PROFILE_CACHE[code]
+    if not force and _meta_fresh(code, max_age_days):
+        prof = _meta_disk().get(code)
+        with _NAV_LOCK:
+            _PROFILE_CACHE[code] = prof
+        return prof
     prof = _fetch_profile_uncached(code)
     if prof:
         with _NAV_LOCK:
@@ -721,10 +745,11 @@ def _fetch_profile_uncached(code):
 
 
 def prefetch_profiles(codes):
-    """并发预热概况缓存（只取缺失项），返回 code -> profile。"""
+    """并发预热概况缓存（跳过内存已有 + 持久缓存仍在有效期内的），返回 code -> profile。"""
     todo = [c for c in dict.fromkeys(codes) if c]
     with _NAV_LOCK:
         todo = [c for c in todo if c not in _PROFILE_CACHE]
+    todo = [c for c in todo if not _meta_fresh(c, PROFILE_TTL_DAYS)]
     if not todo:
         return {}
     with concurrent.futures.ThreadPoolExecutor(
