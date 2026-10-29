@@ -16,12 +16,42 @@ CONFIG = os.path.join(HERE, "funds_config.json")
 
 PALETTE = ['#e23b3b', '#f46036', '#7b2cbf', '#2e86ab', '#1faa59', '#e8a33d', '#16a085']
 
-# 推荐池（与现有组合互补：债券压舱石 + A股宽基），代码均经接口验证有效
-RECS = [
-    ("511260", "国泰上证10年国债ETF", "债券·利率压舱石"),
-    ("003376", "广发中债7-10年国开债指数C", "债券·稳健配置"),
-    ("005827", "易方达蓝筹精选混合", "宽基·A股核心资产"),
+# 候选基金池（跨资产类别，用于数据驱动筛选推荐）。
+# fee = 年化综合费率(%)（管理费+托管费+销售服务费，取自招募说明书/官方披露，静态录入，更新频率低）。
+# 注：因可靠的费率 API 在云端不稳定，这里用静态录入；候选均为公开可查的知名基金。
+POOL = [
+    # 利率债 / 信用债（压舱石）
+    ("511260", "国泰上证10年国债ETF", "利率债·ETF", 0.20),
+    ("003376", "广发中债7-10年国开债指数C", "利率债·C类", 0.35),
+    ("003358", "易方达中债3-5年国开债指数C", "利率债·C类", 0.30),
+    ("100018", "富国天利增长债券", "稳健债券", 0.75),
+    ("000191", "富国信用债债券C", "信用债·C类", 0.55),
+    # A股宽基 / 红利
+    ("110020", "易方达沪深300ETF联接A", "宽基·沪深300", 0.20),
+    ("007856", "华夏中证500ETF联接C", "宽基·中证500", 0.40),
+    ("012643", "招商中证红利ETF联接C", "红利", 0.45),
+    ("005561", "创金合信中证红利低波动指数C", "红利低波·C类", 0.50),
+    # 行业 / 主题（与现有组合互补）
+    ("161725", "招商中证白酒指数", "消费", 0.60),
+    ("001632", "天弘中证食品饮料", "消费", 0.55),
+    ("011609", "国泰中证动漫游戏ETF联接C", "行业·传媒游戏", 0.60),
+    # 港股 / 海外
+    ("000071", "华夏恒生ETF联接A", "港股", 0.60),
+    ("270042", "广发纳斯达克100指数", "QDII·纳指", 1.00),
+    ("161130", "易方达纳斯达克100", "QDII·纳指", 0.80),
+    # 黄金
+    ("000216", "华安黄金易ETF联接A", "黄金", 0.60),
+    ("002610", "博时黄金ETF联接C", "黄金·C类", 0.70),
+    # 主动混合（核心资产 / 均衡）
+    ("005827", "易方达蓝筹精选混合", "主动·核心资产", 1.40),
+    ("163406", "兴全合润混合", "主动·均衡", 1.50),
+    ("110011", "易方达中小盘混合", "主动·价值", 1.50),
 ]
+
+# 数据驱动筛选权重（用于综合打分）
+W_SHARPE = 0.40
+W_MDD = 0.35
+W_FEE = 0.25
 
 
 def load_config():
@@ -29,7 +59,7 @@ def load_config():
         return json.load(f)
 
 
-def fetch_nav(code, start_date="2026-06-01"):
+def fetch_nav(code, start_date="2025-06-01"):
     """东方财富历史净值（分页拉取，单页上限约20条）。返回升序 (dates, dwjz, ljjz)。"""
     rows = []
     page = 1
@@ -40,12 +70,17 @@ def fetch_nav(code, start_date="2026-06-01"):
         cmd = ["curl", "-sS", "-L", url,
                "-H", "Referer: http://fundf10.eastmoney.com/",
                "-H", "User-Agent: Mozilla/5.0"]
-        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=30)
-        if p.returncode != 0 or not p.stdout.strip():
-            break
-        try:
-            data = json.loads(p.stdout)
-        except Exception:
+        data = None
+        for _ in range(3):
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=30)
+                if p.returncode == 0 and p.stdout.strip():
+                    data = json.loads(p.stdout)
+                    break
+            except Exception:
+                pass
+            time.sleep(2)
+        if data is None:
             break
         lst = (data.get("Data") or {}).get("LSJZList") or []
         if not lst:
@@ -244,30 +279,68 @@ def build_fund(cfg, idx):
     }
 
 
-def build_recs():
-    res = []
-    for code, name, meta in RECS:
+def screen_metrics(ljjz, fee_pct):
+    """基于近1年累计净值序列算风险指标 + 综合费率。"""
+    n = min(len(ljjz), 252)
+    win = ljjz[-n:]
+    rets = daily_returns(win)
+    vol = ann_vol_pct(rets)
+    sh = round(sharpe(rets), 2)
+    so = round(sortino(rets), 2)
+    mdd = max_drawdown(win)
+    ar = round(cagr(win, n) * 100, 2)  # 年化收益 %
+    return {"vol": vol, "sharpe": sh, "sortino": so, "mdd": mdd, "annRet": ar, "fee": fee_pct}
+
+
+def _norm(vals):
+    lo, hi = min(vals), max(vals)
+    if hi - lo < 1e-9:
+        return [0.5 for _ in vals]
+    return [(v - lo) / (hi - lo) for v in vals]
+
+
+def screen_pool(held_codes):
+    """数据驱动筛选：从 POOL 按 低回撤+正夏普+低费率 综合打分，返回 Top 推荐。"""
+    raw = []
+    for code, name, cat, fee in POOL:
+        if code in held_codes:
+            continue
         try:
             dates, dwjz, ljjz = fetch_nav(code)
-            if len(ljjz) < 70:
+            if len(ljjz) < 180:   # 至少约9个月数据才有意义
                 continue
-            end = len(ljjz) - 1
-            m1 = window_ret(ljjz, 21, end)
-            m3 = window_ret(ljjz, 63, end)
-            mdd = max_drawdown(ljjz[-126:])
-            sh = round(sharpe(daily_returns(ljjz[-min(len(ljjz), 252):])), 2)
-            res.append({
-                "code": code, "name": name,
-                "meta": "%s ｜ 近1月 %+.1f%% / 近3月 %+.1f%% / 回撤 %+.1f%% / 夏普 %.2f" % (meta, m1, m3, mdd, sh),
-                "p": "与现有组合（偏权益+黄金）互补：债券压舱石+宽基，可降低整体波动，适合分批配置。",
-            })
+            m = screen_metrics(ljjz, fee)
+            raw.append({"code": code, "name": name, "cat": cat, "m": m})
         except Exception:
             continue
-    return res[:3]
+    if not raw:
+        return []
+    n_sh = _norm([x["m"]["sharpe"] for x in raw])
+    n_md = _norm([-x["m"]["mdd"] for x in raw])
+    n_fe = _norm([-x["m"]["fee"] for x in raw])
+    for i, x in enumerate(raw):
+        x["score"] = round(W_SHARPE * n_sh[i] + W_MDD * n_md[i] + W_FEE * n_fe[i], 3)
+    raw.sort(key=lambda x: x["score"], reverse=True)
+    # 优先正夏普、回撤可控；不足再放宽
+    good = [x for x in raw if x["m"]["sharpe"] >= 0 and x["m"]["mdd"] >= -20]
+    pick = good[:6] if len(good) >= 3 else raw[:6]
+    res = []
+    for x in pick:
+        m = x["m"]
+        res.append({
+            "code": x["code"], "name": x["name"], "cat": x["cat"],
+            "meta": "%s ｜ 年化收益 %+.1f%% / 近1年回撤 %+.1f%% / 夏普 %.2f / 索提诺 %.2f / 综合费率 %.2f%%"
+                    % (x["cat"], m["annRet"], m["mdd"], m["sharpe"], m["sortino"], m["fee"]),
+            "p": ("风险调整后收益为正、回撤可控、费率偏低，与现有组合（偏权益+黄金）互补，可分散波动、分批配置。"
+                  if m["sharpe"] >= 0 else
+                  "当前风险调整后收益为负，仅作观察，不建议急于建仓。"),
+            "score": x["score"],
+        })
+    return res
 
 
-def render(template, asof, funds, recs, start_map):
-    sub = "数据日期：%s ｜ 覆盖 %d 只自选基金 ｜ 红涨绿跌（中国市场惯例）｜ 建议基于风险指标，仅供参考" % (asof, len(funds))
+def render(template, asof, funds, recs, start_map, expert):
+    sub = "数据日期：%s ｜ 覆盖 %d 只自选基金 ｜ 红涨绿跌（中国市场惯例）｜ 建议基于风险指标与数据驱动筛选，仅供参考" % (asof, len(funds))
     start_info = " ｜ ".join("%s %s" % (c, d) for c, d in start_map.items())
     out = template
     out = out.replace("__SUBTITLE__", sub)
@@ -275,9 +348,22 @@ def render(template, asof, funds, recs, start_map):
     out = out.replace("__START_MAP__", json.dumps(start_map, ensure_ascii=False))
     out = out.replace("__FUNDS__", json.dumps(funds, ensure_ascii=False))
     out = out.replace("__RECS__", json.dumps(recs, ensure_ascii=False))
+    out = out.replace("__EXPERT_JSON__", json.dumps(expert, ensure_ascii=False))
     with open(OUTPUT, "w", encoding="utf-8") as f:
         f.write(out)
     print("[ok] 生成 %s (%d bytes)" % (OUTPUT, os.path.getsize(OUTPUT)))
+
+
+def load_expert():
+    """读取本地万得Alice生成的专家附注（可选；缺失不影响云端自动推送）。"""
+    p = os.path.join(HERE, "expert_notes.json")
+    if os.path.exists(p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"funds": {}, "overall": "", "generatedAt": ""}
 
 
 def main():
@@ -297,9 +383,10 @@ def main():
     if not funds:
         raise SystemExit("无基金数据，生成中止")
     asof = max(f["navSeries"]["dates"][-1] for f in funds)
-    recs = build_recs()
-    render(template, asof, funds, recs, start_map)
-    print("[done] asOf=%s" % asof)
+    recs = screen_pool({f["code"] for f in funds})
+    expert = load_expert()
+    render(template, asof, funds, recs, start_map, expert)
+    print("[done] asOf=%s 推荐%d只 专家附注日期=%s" % (asof, len(recs), expert.get("generatedAt") or "无"))
 
 
 if __name__ == "__main__":

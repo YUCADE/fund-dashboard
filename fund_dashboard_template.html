@@ -114,12 +114,19 @@
   </section>
 
   <section>
-    <h2><span class="tag">推荐</span> 值得关注 / 买入的其他基金</h2>
-    <p class="desc">基于组合缺口筛选。</p>
+    <h2><span class="tag">推荐</span> 数据驱动筛选 · 值得关注的基金</h2>
+    <p class="desc">从跨资产候选池中按「低回撤 + 正夏普 + 低费率」综合打分排序（权重 夏普0.4 / 回撤0.35 / 费率0.25），非人工指定。费率取自招募说明书静态录入。</p>
     <div class="rec" id="rec"></div>
   </section>
 
-  <footer>数据来源：东方财富基金公开数据 ｜ 本看板为基于公开数据的分析可视化，不构成投资建议。</footer>
+  <section>
+    <h2><span class="tag">权威</span> 万得Alice 权威附注与配置建议</h2>
+    <p class="desc">由万得金融大模型（Wind Alice）基于<b>基金定期报告、经理任职、指数估值分位</b>等权威数据生成；本地生成后随仓库发布，<b>电脑关机也不影响每日自动推送</b>。附注生成日期见下。</p>
+    <div id="expertOverall" class="note" style="background:#eef6ff;border-color:#bcd4ff;color:#1d3b6b;"></div>
+    <div class="cards" id="expertCards"></div>
+  </section>
+
+  <footer>数据来源：东方财富基金公开数据（净值/风险指标）＋ 万得Alice（定期报告/估值分位/配置建议）｜ 本看板为基于公开数据的分析可视化，不构成投资建议。</footer>
 </div>
 <script>
 const START_MAP = __START_MAP__;
@@ -257,7 +264,25 @@ document.getElementById('cards').innerHTML = funds.map(f => {
     + '<div class="adv">' + f.adv + '</div></div>';
 }).join('');
 
-document.getElementById('rec').innerHTML = recs.map(r => '<div class="item"><h3>' + r.name + '</h3><div class="meta">' + r.code + ' ｜ ' + r.meta + '</div><p>' + r.p + '</p></div>').join('');
+document.getElementById('rec').innerHTML = recs.map(r => '<div class="item"><h3>' + r.name + ' <span class="code" style="float:none">综合得分 ' + (r.score||0).toFixed(2) + '</span></h3><div class="meta">' + r.code + ' ｜ ' + r.meta + '</div><p>' + r.p + '</p></div>').join('');
+
+/* 万得Alice 权威附注 */
+const EXPERT = __EXPERT_JSON__;
+const expOverall = document.getElementById('expertOverall');
+if (EXPERT && EXPERT.overall) {
+  expOverall.innerHTML = '📌 <b>整体配置建议（生成于 ' + (EXPERT.generatedAt || '未知') + '）</b><br>' + EXPERT.overall;
+} else {
+  expOverall.innerHTML = '（专家附注尚未生成；在 WorkBuddy 中打开本会话即可由万得Alice 生成，不影响每日自动推送。）';
+}
+document.getElementById('expertCards').innerHTML = funds.map(f => {
+  const e = (EXPERT && EXPERT.funds && EXPERT.funds[f.code]) || {};
+  const parts = [];
+  if (e.report) parts.push('<div class="row"><span>最新季报</span><b>' + e.report + '</b></div>');
+  if (e.valuation) parts.push('<div class="row"><span>指数估值分位</span><b>' + e.valuation + '</b></div>');
+  if (e.suggestion) parts.push('<div class="adv">' + e.suggestion + '</div>');
+  if (!parts.length) return '';
+  return '<div class="card"><span class="code">' + f.code + '</span><div class="name">' + f.name + '</div>' + parts.join('') + '</div>';
+}).join('');
 </script>
 </body>
 </html>
