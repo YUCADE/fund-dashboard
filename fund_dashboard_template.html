@@ -114,8 +114,9 @@
   </section>
 
   <section>
-    <h2><span class="tag">推荐</span> 数据驱动筛选 · 值得关注的基金</h2>
-    <p class="desc">从跨资产候选池中按「低回撤 + 正夏普 + 低费率」综合打分排序（权重 夏普0.4 / 回撤0.35 / 费率0.25），非人工指定。费率取自招募说明书静态录入。</p>
+    <h2><span class="tag">推荐</span> 数据驱动筛选 ＋ 万得Alice 优选 · 值得关注</h2>
+    <p class="desc">候选池由东方财富实时榜单按类别取规模/业绩 Top（约数百只），经规模≥5亿、近1年/近2年正收益等质量门槛过滤，再对决赛圈基金拉取真实净值计算「夏普/索提诺/卡玛/最大回撤/费率」综合打分（权重 夏普0.4 / 回撤0.35 / 费率0.25），每类最多 2 只以保证分散。万得Alice 在此基础上做优选并附理由（每月刷新）。</p>
+    <div id="recoOverall" class="note" style="background:#eafaf1;border-color:#9fd9b8;color:#14532d;"></div>
     <div class="rec" id="rec"></div>
   </section>
 
@@ -132,6 +133,7 @@
 const START_MAP = __START_MAP__;
 const funds = __FUNDS__;
 const recs = __RECS__;
+const RECO = __RECO_JSON__;
 const RED='#e23b3b', GREEN='#1faa59';
 const md = d => (d ? d.slice(5) : d); // "2026-08-20" -> "08-20"
 
@@ -268,7 +270,23 @@ document.getElementById('cards').innerHTML = funds.map(f => {
     + '<div class="adv">' + f.adv + '</div></div>';
 }).join('');
 
-document.getElementById('rec').innerHTML = recs.map(r => '<div class="item"><h3>' + r.name + ' <span class="code" style="float:none">综合得分 ' + (r.score||0).toFixed(2) + '</span></h3><div class="meta">' + r.code + ' ｜ ' + r.meta + '</div><p>' + r.p + '</p></div>').join('');
+const recoPick = (RECO && RECO.picks) || {};
+document.getElementById('rec').innerHTML = recs.map(r => {
+  const alice = !!r.alice || !!recoPick[r.code];
+  const head = '<h3>' + r.name + ' <span class="code" style="float:none' + (alice ? ';background:#14532d;color:#fff;' : '') + '">' + (alice ? '万得Alice 推荐' : ('综合得分 ' + (r.score||0).toFixed(2))) + '</span></h3>';
+  const a = recoPick[r.code];
+  const reason = (alice && (r.p || (a && a.reason)))
+      ? '<div class="adv" style="background:#eafaf1;border-color:#9fd9b8;color:#14532d;">💡 万得Alice：' + (r.p || (a && a.reason) || '') + '</div>'
+      : (r.p ? '<p>' + r.p + '</p>' : '');
+  return '<div class="item">' + head + '<div class="meta">' + r.code + ' ｜ ' + r.meta + '</div>' + reason + '</div>';
+}).join('');
+/* 万得Alice 综合推荐建议 */
+const recoOverall = document.getElementById('recoOverall');
+if (RECO && RECO.overall) {
+  recoOverall.innerHTML = '🤖 <b>万得Alice 综合推荐建议（生成于 ' + (RECO.generatedAt || '未知') + '）</b><br>' + RECO.overall;
+} else {
+  recoOverall.innerHTML = '（万得Alice 推荐尚未生成；不影响每日自动推送，生成后将在此显示精选基金与理由。）';
+}
 
 /* 万得Alice 权威附注 */
 const EXPERT = __EXPERT_JSON__;

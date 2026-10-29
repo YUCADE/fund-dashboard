@@ -2,12 +2,12 @@
 """云端版每日基金看板生成器（纯 Python + 东方财富免费接口，不依赖万得/WorkBuddy）。
 
 取数：东方财富基金历史净值接口（单位净值 DWJZ / 累计净值 LJJZ），免费、无需鉴权。
-分析：基于近期动量、自买入日盈亏、最大回撤的规则化加减仓建议 + 候选基金筛选推荐。
+分析：基于风险指标（夏普/索提诺/卡玛/最大回撤）的加减仓建议 + 东方财富实时榜单扩池后的数据驱动筛选 + 万得Alice（本地生成）优选推荐。
 产出：自包含离线 HTML（内联 Chart.js），输出 index.html，供 GitHub Pages 发布。
 
 用法：python3 gen_dashboard.py
 """
-import os, json, datetime, subprocess, time
+import os, json, re, datetime, subprocess, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(HERE, "fund_dashboard_template.html")
@@ -16,37 +16,27 @@ CONFIG = os.path.join(HERE, "funds_config.json")
 
 PALETTE = ['#e23b3b', '#f46036', '#7b2cbf', '#2e86ab', '#1faa59', '#e8a33d', '#16a085']
 
-# 候选基金池（跨资产类别，用于数据驱动筛选推荐）。
-# fee = 年化综合费率(%)（管理费+托管费+销售服务费，取自招募说明书/官方披露，静态录入，更新频率低）。
-# 注：因可靠的费率 API 在云端不稳定，这里用静态录入；候选均为公开可查的知名基金。
-POOL = [
-    # 利率债 / 信用债（压舱石）
-    ("511260", "国泰上证10年国债ETF", "利率债·ETF", 0.20),
-    ("003376", "广发中债7-10年国开债指数C", "利率债·C类", 0.35),
-    ("003358", "易方达中债3-5年国开债指数C", "利率债·C类", 0.30),
-    ("100018", "富国天利增长债券", "稳健债券", 0.75),
-    ("000191", "富国信用债债券C", "信用债·C类", 0.55),
-    # A股宽基 / 红利
-    ("110020", "易方达沪深300ETF联接A", "宽基·沪深300", 0.20),
-    ("007856", "华夏中证500ETF联接C", "宽基·中证500", 0.40),
-    ("012643", "招商中证红利ETF联接C", "红利", 0.45),
-    ("005561", "创金合信中证红利低波动指数C", "红利低波·C类", 0.50),
-    # 行业 / 主题（与现有组合互补）
-    ("161725", "招商中证白酒指数", "消费", 0.60),
-    ("001632", "天弘中证食品饮料", "消费", 0.55),
-    ("011609", "国泰中证动漫游戏ETF联接C", "行业·传媒游戏", 0.60),
-    # 港股 / 海外
-    ("000071", "华夏恒生ETF联接A", "港股", 0.60),
-    ("270042", "广发纳斯达克100指数", "QDII·纳指", 1.00),
-    ("161130", "易方达纳斯达克100", "QDII·纳指", 0.80),
-    # 黄金
-    ("000216", "华安黄金易ETF联接A", "黄金", 0.60),
-    ("002610", "博时黄金ETF联接C", "黄金·C类", 0.70),
-    # 主动混合（核心资产 / 均衡）
-    ("005827", "易方达蓝筹精选混合", "主动·核心资产", 1.40),
-    ("163406", "兴全合润混合", "主动·均衡", 1.50),
-    ("110011", "易方达中小盘混合", "主动·价值", 1.50),
+# 候选池构建（B 方案）：东方财富实时榜单按类别取规模/业绩 Top（约数百只），
+# 经质量门槛（规模≥5亿、近1年/近2年正收益）过滤后，对决赛圈基金拉取真实净值
+# 计算风险指标综合打分。候选池不再写死，由公开数据动态生成，比原 20 只手选更全更可靠。
+# 费率取自榜单返回的「管理费/托管费/销售服务费」字段（公开披露、动态获取，无需静态录入）。
+# 另含少量海外/黄金「卫星」基金（小名单），仍经同一风险引擎打分，保证资产类别覆盖。
+CATEGORIES = [
+    ("gp", "股票型·主动", "主动权益"),
+    ("hh", "混合型",     "混合·均衡"),
+    ("zq", "债券型",     "债券·稳健"),
+    ("zs", "指数型",     "指数·宽基/行业"),
 ]
+SATELLITES = [
+    ("270042", "广发纳斯达克100指数",   "海外·QDII", 1.00),
+    ("000071", "华夏恒生ETF联接A",       "海外·港股", 0.60),
+    ("000216", "华安黄金易ETF联接A",     "黄金",      0.60),
+    ("002610", "博时黄金ETF联接C",       "黄金",      0.70),
+]
+UNI_PER_CAT   = 60      # 每类榜单取前 N 只（按规模）
+UNI_MIN_SCALE = 5.0     # 规模下限（亿元），过滤迷你/清盘风险
+FINAL_PER_CAT = 6       # 每类进入决赛圈（拉真实净值算风险指标）的数量
+MAX_PER_CAT   = 2       # 最终推荐每类最多几只，保证分散
 
 # 数据驱动筛选权重（用于综合打分）
 W_SHARPE = 0.40
@@ -59,8 +49,10 @@ def load_config():
         return json.load(f)
 
 
-def fetch_nav(code, start_date="2025-06-01"):
+def fetch_nav(code, start_date=None):
     """东方财富历史净值（分页拉取，单页上限约20条）。返回升序 (dates, dwjz, ljjz)。"""
+    if start_date is None:
+        start_date = (datetime.date.today() - datetime.timedelta(days=400)).isoformat()
     rows = []
     page = 1
     while page <= 80:
@@ -299,49 +291,194 @@ def _norm(vals):
     return [(v - lo) / (hi - lo) for v in vals]
 
 
-def screen_pool(held_codes):
-    """数据驱动筛选：从 POOL 按 低回撤+正夏普+低费率 综合打分，返回 Top 推荐。"""
-    raw = []
-    for code, name, cat, fee in POOL:
-        if code in held_codes:
+def _pct(s):
+    if not s:
+        return None
+    s = str(s).replace('%', '').strip()
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def fetch_ranking(ft, pn=200, pi=1):
+    """东方财富基金排行榜（按类别取前 N 只，含规模/费率/多周期收益），免费、无需鉴权。"""
+    ed = datetime.date.today().isoformat()
+    sd = (datetime.date.today() - datetime.timedelta(days=370)).isoformat()
+    ts = int(time.time() * 1000)
+    url = ("https://fund.eastmoney.com/data/rankhandler.aspx?op=ph&dt=kf&ft=%s&rs=&gs=0"
+           "&sc=1nzf&st=desc&sd=%s&ed=%s&qdii=&tabSubtype=,,,,,"
+           "&pi=%d&pn=%d&dx=1&_=%d" % (ft, sd, ed, pi, pn, ts))
+    cmd = ["curl", "-sS", "-L", url,
+           "-H", "Referer: https://fund.eastmoney.com/",
+           "-H", "User-Agent: Mozilla/5.0"]
+    for _ in range(3):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=30)
+            if p.returncode == 0 and p.stdout.strip():
+                return parse_ranking(p.stdout)
+        except Exception:
+            pass
+        time.sleep(2)
+    return []
+
+
+def parse_ranking(text):
+    """解析 rankhandler 返回的逗号分隔数据；字段：0代码 1名称 11近1年 12近2年 13近3年 18规模(亿) 19管理费 20托管费 22销售服务费。"""
+    m = re.search(r'datas:\[(.*)\]', text, re.S)
+    if not m:
+        return []
+    items = [it.strip('"') for it in m.group(1).split('","')]
+    out = []
+    for it in items:
+        f = it.split(',')
+        if len(f) < 24:
             continue
         try:
-            dates, dwjz, ljjz = fetch_nav(code)
-            if len(ljjz) < 180:   # 至少约9个月数据才有意义
+            code = f[0].strip()
+            name = f[1].strip()
+            if not code or not name:
                 continue
-            m = screen_metrics(ljjz, fee)
-            raw.append({"code": code, "name": name, "cat": cat, "m": m})
+            scale = _pct(f[18])
+            y1, y2, y3 = _pct(f[11]), _pct(f[12]), _pct(f[13])
+            fee = (_pct(f[19]) or 0) + (_pct(f[20]) or 0) + (_pct(f[22]) or 0)
+            out.append({"code": code, "name": name, "scale": scale,
+                        "y1": y1, "y2": y2, "y3": y3, "fee": round(fee, 3)})
         except Exception:
             continue
-    if not raw:
-        return []
-    n_sh = _norm([x["m"]["sharpe"] for x in raw])
-    n_md = _norm([-x["m"]["mdd"] for x in raw])
-    n_fe = _norm([-x["m"]["fee"] for x in raw])
-    for i, x in enumerate(raw):
+    return out
+
+
+def build_universe():
+    """东方财富实时榜单扩池：按类别取规模 Top，加质量门槛；附海外/黄金卫星。返回候选列表。"""
+    uni = []
+    for ft, cat_label, cat_key in CATEGORIES:
+        try:
+            rows = fetch_ranking(ft, pn=UNI_PER_CAT, pi=1)
+        except Exception:
+            rows = []
+        for r in rows:
+            r["cat"] = cat_key
+            uni.append(r)
+    for code, name, cat, fee in SATELLITES:
+        uni.append({"code": code, "name": name, "cat": cat, "curated": True,
+                    "scale": None, "y1": None, "y2": None, "y3": None, "fee": fee})
+    return uni
+
+
+def screen_universe(held_codes, dump_path=None):
+    """数据驱动筛选（B）：榜单扩池 → 质量门槛 → 决赛圈拉真实净值算风险指标 → 综合打分 → 每类≤2只。
+    返回 (recs, candidates)；candidates 写入 dump_path 供本地万得Alice生成推荐（云端不调用万得）。"""
+    uni = build_universe()
+    cands = []
+    for r in uni:
+        if r["code"] in held_codes:
+            continue
+        if r.get("curated"):           # 卫星基金（海外/黄金）直入，跳过规模/收益门槛
+            cands.append(r)
+            continue
+        sc = r.get("scale")
+        if sc is not None and sc < UNI_MIN_SCALE:
+            continue
+        y1, y2, y3 = r.get("y1"), r.get("y2"), r.get("y3")
+        if y1 is None or y1 <= 0:
+            continue
+        if (y2 is None or y2 <= 0) and (y3 is None or y3 <= 0):
+            continue
+        cands.append(r)
+    if not cands:
+        return [], []
+    # 每类取规模前 FINAL_PER_CAT 作为决赛圈（拉真实净值算风险）
+    by_cat = {}
+    for r in cands:
+        by_cat.setdefault(r["cat"], []).append(r)
+    finalists = []
+    for cat, lst in by_cat.items():
+        lst.sort(key=lambda x: (x.get("scale") or 0), reverse=True)
+        finalists += lst[:FINAL_PER_CAT]
+    # 计算真实风险指标
+    scored = []
+    for r in finalists:
+        try:
+            dates, dwjz, ljjz = fetch_nav(r["code"])
+            if len(ljjz) < 180:   # 至少约9个月数据才有意义
+                continue
+            m = screen_metrics(ljjz, r.get("fee") if r.get("fee") is not None else 0.0)
+            r["m"] = m
+            scored.append(r)
+        except Exception:
+            continue
+    if dump_path:
+        try:
+            with open(dump_path, "w", encoding="utf-8") as f:
+                json.dump([{"code": r["code"], "name": r["name"], "cat": r["cat"],
+                            "scale": r.get("scale"), "y1": r.get("y1"), "y3": r.get("y3"),
+                            "fee": r.get("fee"), "m": r.get("m")} for r in scored],
+                          f, ensure_ascii=False, indent=1)
+        except Exception:
+            pass
+    if not scored:
+        return [], []
+    n_sh = _norm([x["m"]["sharpe"] for x in scored])
+    n_md = _norm([-x["m"]["mdd"] for x in scored])
+    n_fe = _norm([-(x.get("fee") or 0) for x in scored])
+    for i, x in enumerate(scored):
         x["score"] = round(W_SHARPE * n_sh[i] + W_MDD * n_md[i] + W_FEE * n_fe[i], 3)
-    raw.sort(key=lambda x: x["score"], reverse=True)
-    # 优先正夏普、回撤可控；不足再放宽
-    good = [x for x in raw if x["m"]["sharpe"] >= 0 and x["m"]["mdd"] >= -20]
-    pick = good[:6] if len(good) >= 3 else raw[:6]
+    scored.sort(key=lambda x: x["score"], reverse=True)
+
+    def take(qualified_only):
+        pick, per = [], {}
+        for x in scored:
+            if qualified_only and not (x["m"]["sharpe"] >= 0 and x["m"]["mdd"] >= -20):
+                continue
+            if len(pick) >= 6:
+                break
+            c = x["cat"]
+            if per.get(c, 0) >= MAX_PER_CAT:
+                continue
+            per[c] = per.get(c, 0) + 1
+            pick.append(x)
+        return pick
+
+    pick = take(True)
+    if len(pick) < 6:           # 合格不足6只时放宽补满（忽略类别上限）
+        for x in scored:
+            if len(pick) >= 6:
+                break
+            if x not in pick:
+                pick.append(x)
     res = []
     for x in pick:
         m = x["m"]
         res.append({
             "code": x["code"], "name": x["name"], "cat": x["cat"],
-            "meta": "%s ｜ 年化收益 %+.1f%% / 近1年回撤 %+.1f%% / 夏普 %.2f / 索提诺 %.2f / 综合费率 %.2f%%"
-                    % (x["cat"], m["annRet"], m["mdd"], m["sharpe"], m["sortino"], m["fee"]),
+            "meta": "%s ｜ 规模%s亿 ｜ 年化收益 %+.1f%% / 近1年回撤 %+.1f%% / 夏普 %.2f / 索提诺 %.2f / 综合费率 %.2f%%"
+                  % (x["cat"], ("%.1f" % x["scale"]) if x.get("scale") else "?",
+                     m["annRet"], m["mdd"], m["sharpe"], m["sortino"], (x.get("fee") or 0)),
             "p": ("风险调整后收益为正、回撤可控、费率偏低，与现有组合（偏权益+黄金）互补，可分散波动、分批配置。"
                   if m["sharpe"] >= 0 else
                   "当前风险调整后收益为负，仅作观察，不建议急于建仓。"),
-            "score": x["score"],
+            "score": x["score"], "alice": None,
         })
-    return res
+    return res, scored
 
 
-def render(template, asof, funds, recs, start_map, expert):
-    sub = "数据日期：%s ｜ 覆盖 %d 只自选基金 ｜ 红涨绿跌（中国市场惯例）｜ 建议基于风险指标与数据驱动筛选，仅供参考" % (asof, len(funds))
+def load_recommendations():
+    """读取本地万得Alice生成的推荐（可选；缺失不影响云端自动推送）。"""
+    p = os.path.join(HERE, "recommendations.json")
+    if os.path.exists(p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"picks": [], "overall": "", "generatedAt": ""}
+
+
+def render(template, asof, funds, recs, start_map, expert, reco):
+    sub = "数据日期：%s ｜ 覆盖 %d 只自选基金 ｜ 红涨绿跌（中国市场惯例）｜ 推荐=东方财富实时榜单扩池+风险指标打分+万得Alice优选，仅供参考" % (asof, len(funds))
     start_info = " ｜ ".join("%s %s" % (c, d) for c, d in start_map.items())
+    reco_picks = {p.get("code"): p for p in (reco.get("picks") or [])}
     out = template
     out = out.replace("__SUBTITLE__", sub)
     out = out.replace("__STARTINFO__", start_info)
@@ -349,6 +486,9 @@ def render(template, asof, funds, recs, start_map, expert):
     out = out.replace("__FUNDS__", json.dumps(funds, ensure_ascii=False))
     out = out.replace("__RECS__", json.dumps(recs, ensure_ascii=False))
     out = out.replace("__EXPERT_JSON__", json.dumps(expert, ensure_ascii=False))
+    out = out.replace("__RECO_JSON__", json.dumps(
+        {"overall": reco.get("overall", ""), "generatedAt": reco.get("generatedAt", ""),
+         "picks": reco_picks}, ensure_ascii=False))
     with open(OUTPUT, "w", encoding="utf-8") as f:
         f.write(out)
     print("[ok] 生成 %s (%d bytes)" % (OUTPUT, os.path.getsize(OUTPUT)))
@@ -383,10 +523,36 @@ def main():
     if not funds:
         raise SystemExit("无基金数据，生成中止")
     asof = max(f["navSeries"]["dates"][-1] for f in funds)
-    recs = screen_pool({f["code"] for f in funds})
+    recs, candidates = screen_universe({f["code"] for f in funds},
+                                      os.path.join(HERE, "screen_candidates.json"))
     expert = load_expert()
-    render(template, asof, funds, recs, start_map, expert)
-    print("[done] asOf=%s 推荐%d只 专家附注日期=%s" % (asof, len(recs), expert.get("generatedAt") or "无"))
+    reco = load_recommendations()
+    # 万得Alice推荐存在时，以其精选列表作为主推荐（候选池仍由榜单扩池+风险筛选产生）；
+    # 缺失时退回数据驱动筛选结果，保证关机也能正常推送。
+    if reco.get("picks"):
+        cmap = {c["code"]: c for c in candidates}
+        disp = []
+        for p in reco["picks"]:
+            c = cmap.get(p.get("code"))
+            if c:
+                m = c["m"]
+                meta = p.get("meta") or ("%s ｜ 规模%s亿 ｜ 年化收益 %+.1f%% / 近1年回撤 %+.1f%% / 夏普 %.2f / 索提诺 %.2f / 综合费率 %.2f%%"
+                       % (c["cat"], ("%.1f" % c["scale"]) if c.get("scale") else "?",
+                          m["annRet"], m["mdd"], m["sharpe"], m["sortino"], c.get("fee") or 0))
+                name = p.get("name") or c["name"]
+                cat = c["cat"]
+            else:
+                meta = p.get("meta") or ""
+                name = p.get("name", "")
+                cat = p.get("cat", "")
+            disp.append({"code": p.get("code"), "name": name, "cat": cat, "meta": meta,
+                         "p": p.get("reason", "") or "万得Alice 精选推荐。", "score": None, "alice": True})
+        if disp:
+            recs = disp
+    render(template, asof, funds, recs, start_map, expert, reco)
+    src = "万得Alice精选" if reco.get("picks") else "数据驱动筛选"
+    print("[done] asOf=%s 推荐%d只(%s) 专家附注=%s 万得推荐=%s" % (
+        asof, len(recs), src, expert.get("generatedAt") or "无", reco.get("generatedAt") or "无"))
 
 
 if __name__ == "__main__":
