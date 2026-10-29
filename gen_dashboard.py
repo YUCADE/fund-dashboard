@@ -7,7 +7,7 @@
 
 用法：python3 gen_dashboard.py
 """
-import os, json, re, sys, datetime, time, threading, urllib.request, urllib.error
+import os, json, re, sys, gzip, datetime, time, threading, urllib.request, urllib.error
 import concurrent.futures
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -63,9 +63,13 @@ def _http_get(url, referer, timeout=HTTP_TIMEOUT):
         "Referer": referer,
         "Accept": "*/*",
         "Accept-Language": "zh-CN,zh;q=0.9",
+        "Accept-Encoding": "gzip",      # 全历史净值 JS 体量大，压缩后传输量约降到 1/6
     })
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "ignore")
+        raw = r.read()
+        if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+            raw = gzip.decompress(raw)
+        return raw.decode("utf-8", "ignore")
 
 
 def _http_get_retry(url, referer, tries=2, timeout=HTTP_TIMEOUT):
