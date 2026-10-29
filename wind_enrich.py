@@ -130,6 +130,13 @@ def run():
     if not cli:
         print("[!] 未找到万得Alice CLI（alice-financial-copilot 或 skill cache/cli.mjs）")
         sys.exit(2)
+    # 每次运行前通过连接器刷新凭据（零交互），避免 token 过期导致 401
+    try:
+        lr = subprocess.run(cli + ["login", "--from-connector"],
+                            capture_output=True, text=True, encoding="utf-8", timeout=120)
+        print("[*] 已刷新万得登录凭据" if (lr.returncode == 0) else "[!] 刷新凭据返回码=%d（继续尝试）" % lr.returncode)
+    except Exception as e:
+        print("[!] 刷新凭据失败（继续尝试）：", e)
     held = load_config()
     cands = load_candidates()
     if not cands:
