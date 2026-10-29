@@ -112,24 +112,92 @@ def ytd_ret(series, dates, end):
     return round(pct(series[end], series[si]), 2)
 
 
-def verdict(hold_ret, typ):
-    if typ == "bull":
-        return "已盈利、技术面看多：可继续持有 / 分批加仓" if hold_ret >= 0 else "浮亏中、技术面看多：可逢低补仓摊薄成本"
-    if typ == "bear":
-        return "已盈利但技术面转弱：建议逢高减仓、锁定收益" if hold_ret >= 0 else "已浮亏且技术面走弱：建议减仓或止损观望"
-    return "盈利中、中性持有" if hold_ret >= 0 else "浮亏中、中性观望"
+def daily_returns(series):
+    return [series[i] / series[i - 1] - 1 for i in range(1, len(series)) if series[i - 1]]
 
 
-def decide(ret, hold_ret, mdd):
-    m1 = ret["m1"]
-    m3 = ret["m3"]
-    if m1 >= 2 and hold_ret >= 0:
-        return "bull", "持有 / 小幅加仓", "近1月 %+.1f%%、自买入盈利 %+.1f%%，趋势偏强可继续持有" % (m1, hold_ret)
-    if m1 <= -3 or (hold_ret <= -5 and m3 < 0):
-        return "bear", "逢高减仓 / 观望", "近1月 %+.1f%%、自买入 %+.1f%%，技术面走弱建议减仓" % (m1, hold_ret)
+def _mean(x):
+    return sum(x) / len(x) if x else 0.0
+
+
+def _std(x):
+    n = len(x)
+    if n < 2:
+        return 0.0
+    m = _mean(x)
+    return (sum((v - m) ** 2 for v in x) / (n - 1)) ** 0.5
+
+
+def ann_vol_pct(returns):
+    return round(_std(returns) * (252 ** 0.5) * 100, 1)
+
+
+def ann_ret_ari(returns):
+    return _mean(returns) * 252
+
+
+def sharpe(returns, rf=0.02):
+    v = _std(returns)
+    if v <= 0:
+        return 0.0
+    return (ann_ret_ari(returns) - rf) / (v * (252 ** 0.5))
+
+
+def sortino(returns, rf=0.02):
+    downs = [r for r in returns if r < 0]
+    dd = _std(downs)
+    if dd <= 0:
+        return 0.0
+    return (ann_ret_ari(returns) - rf) / (dd * (252 ** 0.5))
+
+
+def cagr(series, n):
+    if n < 2 or series[0] <= 0:
+        return 0.0
+    return (series[-1] / series[0]) ** (252.0 / n) - 1
+
+
+def calmar(cagr_val, mdd_pct):
+    if mdd_pct >= 0:
+        return 0.0
+    return round(cagr_val / abs(mdd_pct / 100.0), 2)
+
+
+def risk_metrics(series):
+    """基于近1年累计净值序列，算年化波动/夏普/索提诺/卡玛/最大回撤（无需基准）。"""
+    n = min(len(series), 252)
+    win = series[-n:]
+    rets = daily_returns(win)
+    vol = ann_vol_pct(rets)
+    sh = round(sharpe(rets), 2)
+    so = round(sortino(rets), 2)
+    mdd = max_drawdown(win)           # 负值百分比
+    cal = calmar(cagr(win, n), mdd)
+    return {"vol": vol, "sharpe": sh, "sortino": so, "calmar": cal, "mdd": mdd}
+
+
+def decision(hold_ret, r):
+    """基于风险调整指标给出持有/控仓建议（非择时预测，仅供参考）。"""
+    sh, vol, cal, so, mdd = r["sharpe"], r["vol"], r["calmar"], r["sortino"], r["mdd"]
+    if hold_ret < 0 and mdd <= -20:
+        return ("bear", "控仓 / 观望",
+                "自买入 %+.1f%%，近1年最大回撤 %d%%，波动偏大，建议控仓等待企稳" % (hold_ret, mdd))
+    if sh < 0:
+        return ("bear", "减仓 / 换仓考量",
+                "夏普 %.2f（风险调整后收益为负）、近1年回撤 %d%%，可考虑减仓或换基" % (sh, mdd))
+    if sh >= 1.0 and hold_ret >= 0:
+        return ("bull", "持有（风险收益佳）",
+                "夏普 %.2f、卡玛 %.2f、年化波动 %d%%，风险收益比健康，可继续持有" % (sh, cal, vol))
     if hold_ret >= 0:
-        return "neutral", "盈利中、中性持有", "自买入盈利 %+.1f%%，近1月 %+.1f%%，可持有观察" % (hold_ret, m1)
-    return "neutral", "浮亏中、中性观望", "自买入 %+.1f%%，近1月 %+.1f%%，暂观望等待企稳" % (hold_ret, m1)
+        return ("neutral", "持有 / 中性",
+                "自买入盈利 %+.1f%%，夏普 %.2f，可持有观察" % (hold_ret, sh))
+    return ("neutral", "观望 / 分批",
+            "自买入 %+.1f%%，夏普 %.2f、回撤 %d%%，暂观望或定投分批" % (hold_ret, sh, mdd))
+
+
+def risk_summary(r):
+    return "夏普 %.2f · 年化波动 %d%% · 卡玛 %.2f · 索提诺 %.2f" % (
+        r["sharpe"], r["vol"], r["calmar"], r["sortino"])
 
 
 def build_fund(cfg, idx):
@@ -160,8 +228,9 @@ def build_fund(cfg, idx):
         "y1": window_ret(ljjz, 252, end),
     }
     mdd = max_drawdown(ljjz[max(0, end - 252):end + 1])
-    typ, action, adv = decide(ret, hold_ret, mdd)
-    hv = verdict(hold_ret, typ)
+    rsk = risk_metrics(ljjz)
+    typ, action, adv = decision(hold_ret, rsk)
+    hv = risk_summary(rsk)
     return {
         "code": code, "name": name, "short": name,
         "color": PALETTE[idx % len(PALETTE)],
@@ -169,7 +238,7 @@ def build_fund(cfg, idx):
         "action": action, "type": typ, "adv": adv,
         "buyDate": buy_date, "buyNav": round(buy_nav, 4),
         "holdRet": hold_ret, "holdDays": hold_days,
-        "holdVerdict": hv,
+        "holdVerdict": hv, "risk": rsk,
         "navSeries": {"dates": dates, "vals": dwjz},
         "accVals": ljjz,
     }
@@ -186,9 +255,10 @@ def build_recs():
             m1 = window_ret(ljjz, 21, end)
             m3 = window_ret(ljjz, 63, end)
             mdd = max_drawdown(ljjz[-126:])
+            sh = round(sharpe(daily_returns(ljjz[-min(len(ljjz), 252):])), 2)
             res.append({
                 "code": code, "name": name,
-                "meta": "%s ｜ 近1月 %+.1f%% / 近3月 %+.1f%% / 回撤 %+.1f%%" % (meta, m1, m3, mdd),
+                "meta": "%s ｜ 近1月 %+.1f%% / 近3月 %+.1f%% / 回撤 %+.1f%% / 夏普 %.2f" % (meta, m1, m3, mdd, sh),
                 "p": "与现有组合（偏权益+黄金）互补：债券压舱石+宽基，可降低整体波动，适合分批配置。",
             })
         except Exception:
@@ -197,7 +267,7 @@ def build_recs():
 
 
 def render(template, asof, funds, recs, start_map):
-    sub = "数据日期：%s ｜ 覆盖 %d 只自选基金 ｜ 红涨绿跌（中国市场惯例）" % (asof, len(funds))
+    sub = "数据日期：%s ｜ 覆盖 %d 只自选基金 ｜ 红涨绿跌（中国市场惯例）｜ 建议基于风险指标，仅供参考" % (asof, len(funds))
     start_info = " ｜ ".join("%s %s" % (c, d) for c, d in start_map.items())
     out = template
     out = out.replace("__SUBTITLE__", sub)

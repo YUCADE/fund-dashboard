@@ -251,6 +251,9 @@ document.getElementById('cards').innerHTML = funds.map(f => {
     + '<div class="row"><span>最新净值</span><b>' + f.nav.toFixed(4) + '</b></div>'
     + '<div class="row"><span>近1月 / 近6月</span><b><span class="' + (f.ret.m1 >= 0 ? 'up' : 'down') + '">' + (f.ret.m1 > 0 ? '+' : '') + f.ret.m1 + '%</span> / <span class="' + (f.ret.m6 >= 0 ? 'up' : 'down') + '">' + (f.ret.m6 > 0 ? '+' : '') + f.ret.m6 + '%</span></b></div>'
     + '<div class="row"><span>近1年最大回撤</span><b class="down">' + f.mdd + '%</b></div>'
+    + '<div class="row"><span>年化波动率</span><b>' + f.risk.vol + '%</b></div>'
+    + '<div class="row"><span>夏普 / 索提诺</span><b>' + f.risk.sharpe + ' / ' + f.risk.sortino + '</b></div>'
+    + '<div class="row"><span>卡玛比率</span><b>' + f.risk.calmar + '</b></div>'
     + '<div class="adv">' + f.adv + '</div></div>';
 }).join('');
 
