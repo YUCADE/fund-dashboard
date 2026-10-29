@@ -41,7 +41,7 @@ MAX_PER_CAT   = 2       # 最终推荐每类最多几只，保证分散
 
 # 性能相关（云端 GitHub Actions 单次运行时长直接决定微信推送延迟）
 NAV_LOOKBACK_DAYS = 420  # 净值回溯天数（≈285 个交易日，足够算 252 日风险指标）
-NAV_MAX_WORKERS   = 12   # 净值并发数（pingzhongdata 为 CDN 静态文件，可承受较高并发）
+NAV_MAX_WORKERS   = 6    # 净值并发数：实测 6 并发最稳，更高并发会被服务端节流（单请求耗时反而翻倍）
 HTTP_TIMEOUT      = 15
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
