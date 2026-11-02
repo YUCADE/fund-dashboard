@@ -2,8 +2,8 @@ name: 每日基金看板
 
 on:
   schedule:
-    - cron: '0 12 * * *'          # 北京 20:00 = UTC 12:00（主）
-    - cron: '40 12 * * *'         # 北京 20:40（备用：GitHub 定时器有时会延迟/丢弃主任务，靠这条补上）
+    - cron: '0 12 * * 1-5'        # 仅工作日：北京 周一~周五 20:00 = UTC 周一~周五 12:00（主）
+    - cron: '40 12 * * 1-5'       # 仅工作日（备用：GitHub 定时有时延迟/丢弃主任务，靠这条补上）
   workflow_dispatch:
     inputs:
       force:
@@ -20,13 +20,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 检查今日是否已推送（防止主/备两条定时重复推微信）
+      - name: 检查今日是否已推送（防止主/备两条定时重复推微信 + 仅工作日）
         id: guard
         run: |
           TODAY=$(date -u +%F)
           MARK=$(cat .last_push_date 2>/dev/null | tr -d '[:space:]')
           FORCE="${{ github.event.inputs.force }}"
-          if [ "$FORCE" = "true" ]; then
+          DOW=$(date -u +%u)   # 1=周一..7=周日（UTC 视角，与 cron 一致；GitHub 延迟<12h 不跨日）
+          if [ "$FORCE" != "true" ] && [ "$DOW" -ge 6 ]; then
+            echo "UTC 今天是周末(周$DOW)，按『仅工作日』规则跳过"; echo "skip=1" >> "$GITHUB_OUTPUT"
+          elif [ "$FORCE" = "true" ]; then
             echo "手动强制运行"; echo "skip=0" >> "$GITHUB_OUTPUT"
           elif [ "$MARK" = "$TODAY" ]; then
             echo "今日($TODAY)已推送过，本次跳过"; echo "skip=1" >> "$GITHUB_OUTPUT"
